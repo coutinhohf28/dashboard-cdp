@@ -97,6 +97,7 @@ CONTAS = {
     "daniel":   {"nome": "Daniel",          "setor": "MARKETING DIGITAL", "senha": "123456", "perfil": "operacional"},
     "imprensa": {"nome": "Michelle Phiffer","setor": "IMPRENSA",          "senha": "cdp2",   "perfil": "operacional"},
     "projetos": {"nome": "Viviane Moura",   "setor": "PROJETOS",          "senha": "cdp3",   "perfil": "operacional"},
+    "Fernanda": {"nome": "Fernanda Barbosa",  "setor": "APRENDIZ",          "senha": "cdp4",   "perfil": "operacional"},
     "gerencia": {"nome": "Helder Coutinho", "setor": "GERÊNCIA",          "senha": "Hc!24601","perfil": "gerencia"},
 }
 
