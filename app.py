@@ -15,6 +15,7 @@ import plotly.graph_objects as go
 import psycopg2
 from psycopg2 import pool as pg_pool
 import streamlit as st
+from di_auth import CONTAS, authenticate
 
 # set_page_config DEVE ser o primeiro comando Streamlit do script
 st.set_page_config(
@@ -92,14 +93,18 @@ def format_br(valor):
 # ------------------------------------------------------------
 #  LOGIN — sistema único (multiusuário com perfis)
 # ------------------------------------------------------------
-CONTAS = {
-    "alice":    {"nome": "Alice Karine",    "setor": "MARKETING DIGITAL", "senha": "123456", "perfil": "operacional"},
-    "daniel":   {"nome": "Daniel",          "setor": "MARKETING DIGITAL", "senha": "123456", "perfil": "operacional"},
-    "imprensa": {"nome": "Michelle Phiffer","setor": "IMPRENSA",          "senha": "cdp2",   "perfil": "operacional"},
-    "projetos": {"nome": "Viviane Moura",   "setor": "PROJETOS",          "senha": "cdp3",   "perfil": "operacional"},
-    "fernanda": {"nome": "Fernanda Barbosa",  "setor": "APRENDIZ",          "senha": "Cdp4",   "perfil": "operacional"},
-    "gerencia": {"nome": "Helder Coutinho", "setor": "GERÊNCIA",          "senha": "Hc!24601","perfil": "gerencia"},
-}
+def _db_url() -> str:
+    """Lê a URL do banco de variável de ambiente ou st.secrets."""
+    url = os.environ.get("DATABASE_URL", "")
+    if not url:
+        try:
+            url = st.secrets["DATABASE_URL"]
+        except Exception:
+            url = ""
+    # Supabase às vezes retorna postgres:// — psycopg2 precisa de postgresql://
+    if url.startswith("postgres://"):
+        url = url.replace("postgres://", "postgresql://", 1)
+    return url
 
 def _perfil():
     try:
@@ -108,14 +113,27 @@ def _perfil():
         return "operacional"
 def _is_gerente(): return _perfil() == "gerencia"
 
-def _verificar_senha(login: str, senha_digitada: str) -> bool:
-    """Verifica senha: CONTAS dict (lookup instantâneo, sem DB no login)."""
-    if login not in CONTAS:
-        return False
-    return CONTAS[login]["senha"] == senha_digitada
+def _verificar_senha(login, senha, nova=None):
+    try:
+        return authenticate(_db_url(), login, senha, nova)
+    except (psycopg2.Error, ValueError):
+        st.error("Serviço de autenticação indisponível. Contate a gerência.")
+        st.stop()
 
 
-if "autenticado" not in st.session_state:
+def _alterar_senha(login, atual, nova, confirmacao):
+    if len(nova) < 12 or nova == atual:
+        st.error("Escolha uma nova senha com pelo menos 12 caracteres.")
+    elif nova != confirmacao:
+        st.error("As senhas não conferem.")
+    elif _verificar_senha(login, atual, nova):
+        st.success("Senha alterada com sucesso.")
+    else:
+        st.error("Confira a senha atual e tente novamente.")
+
+
+if not st.session_state.get("_login_privado_v1"):
+    st.session_state._login_privado_v1 = True
     st.session_state.autenticado = False
     st.session_state.user_data = None
 
@@ -794,33 +812,6 @@ st.markdown(CSS_GLOBAL, unsafe_allow_html=True)
 
 # (overlay JS removido)
 
-# ── Sincroniza senhas alteradas pelo usuário (DB → CONTAS em memória) ─────────
-# Roda apenas uma vez por sessão para evitar queries repetidas
-if not st.session_state.get("_senhas_sincronizadas"):
-    try:
-        _url_sync = os.environ.get("DATABASE_URL", "")
-        if not _url_sync:
-            try:
-                _url_sync = st.secrets["DATABASE_URL"]
-            except Exception:
-                _url_sync = ""
-        if _url_sync.startswith("postgres://"):
-            _url_sync = _url_sync.replace("postgres://", "postgresql://", 1)
-        if _url_sync:
-            _conn_sync = psycopg2.connect(_url_sync, connect_timeout=3)
-            with _conn_sync.cursor() as _cur_sync:
-                _cur_sync.execute(
-                    "SELECT login, senha FROM Usuario_Senhas"
-                )
-                for _row_s in _cur_sync.fetchall():
-                    if _row_s[0] in CONTAS:
-                        CONTAS[_row_s[0]]["senha"] = _row_s[1]
-            _conn_sync.close()
-    except Exception:
-        pass
-    st.session_state["_senhas_sincronizadas"] = True
-
-
 # ============================================================
 #  DESIGN SYSTEM — COMPONENTES PYTHON REUTILIZÁVEIS
 # ============================================================
@@ -974,19 +965,6 @@ menu = st.session_state.current_page
 # ------------------------------------------------------------
 #  BANCO DE DADOS — Supabase / PostgreSQL
 # ------------------------------------------------------------
-def _db_url() -> str:
-    """Lê a URL do banco de variável de ambiente ou st.secrets."""
-    url = os.environ.get("DATABASE_URL", "")
-    if not url:
-        try:
-            url = st.secrets["DATABASE_URL"]
-        except Exception:
-            url = ""
-    # Supabase às vezes retorna postgres:// — psycopg2 precisa de postgresql://
-    if url.startswith("postgres://"):
-        url = url.replace("postgres://", "postgresql://", 1)
-    return url
-
 @st.cache_resource
 def _pool() -> pg_pool.ThreadedConnectionPool:
     """Pool de conexões (reutilizado entre reruns do Streamlit)."""
@@ -4089,25 +4067,12 @@ elif menu == "Ações":
     # ── Minha Senha ──────────────────────────────────────────────────────────
     with st.expander("Alterar minha senha"):
         _login_cur = next((k for k, v in CONTAS.items() if v.get("nome") == meu_nome), None)
-        run_exec("""CREATE TABLE IF NOT EXISTS Usuario_Senhas (login TEXT PRIMARY KEY, senha TEXT NOT NULL)""")
         with st.form("form_senha_acao", clear_on_submit=True):
             _s1 = st.text_input("Senha atual",        type="password", placeholder="••••••")
-            _s2 = st.text_input("Nova senha",         type="password", placeholder="Mínimo 6 caracteres")
+            _s2 = st.text_input("Nova senha",         type="password", placeholder="Mínimo 12 caracteres")
             _s3 = st.text_input("Confirmar nova senha", type="password", placeholder="Repita a nova senha")
             if st.form_submit_button("Salvar", use_container_width=True, type="primary"):
-                _df_s = run_query("SELECT senha FROM Usuario_Senhas WHERE login=%s", (_login_cur,))
-                _senha_ok = _df_s.iloc[0]["senha"] if not _df_s.empty else CONTAS.get(_login_cur,{}).get("senha","")
-                if not _s1:
-                    st.error("Informe a senha atual.")
-                elif _s1 != _senha_ok:
-                    st.error("Senha atual incorreta.")
-                elif len(_s2) < 6:
-                    st.error("A nova senha deve ter pelo menos 6 caracteres.")
-                elif _s2 != _s3:
-                    st.error("As senhas não conferem.")
-                else:
-                    run_exec("INSERT INTO Usuario_Senhas (login,senha) VALUES (%s,%s) ON CONFLICT (login) DO UPDATE SET senha=EXCLUDED.senha", (_login_cur, _s2))
-                    st.success("Senha alterada com sucesso.")
+                _alterar_senha(_login_cur, _s1, _s2, _s3)
 
 
 elif menu == "Almoço CDP":
@@ -5799,21 +5764,7 @@ with st.expander(f"Conta — {_ud.get('nome','')}", expanded=False):
             _s2 = st.text_input("Nova senha",          type="password")
             _s3 = st.text_input("Confirmar nova senha", type="password")
             if st.form_submit_button("Salvar", use_container_width=True, type="primary"):
-                _df_s = run_query("SELECT senha FROM Usuario_Senhas WHERE login=%s", (_login_cur,))
-                _senha_ok = _df_s.iloc[0]["senha"] if not _df_s.empty else CONTAS.get(_login_cur, {}).get("senha", "")
-                if not _s1:
-                    st.error("Informe a senha atual.")
-                elif _s1 != _senha_ok:
-                    st.error("Senha atual incorreta.")
-                elif len(_s2) < 6:
-                    st.error("A nova senha deve ter pelo menos 6 caracteres.")
-                elif _s2 != _s3:
-                    st.error("As senhas não conferem.")
-                elif _login_cur is None:
-                    st.error("Usuário não identificado.")
-                else:
-                    run_exec("INSERT INTO Usuario_Senhas (login,senha) VALUES (%s,%s) ON CONFLICT (login) DO UPDATE SET senha=EXCLUDED.senha", (_login_cur, _s2))
-                    st.success("Senha alterada com sucesso.")
+                _alterar_senha(_login_cur, _s1, _s2, _s3)
     if _is_gerente():
         # Backup SOB DEMANDA — só gera quando clicado (antes rodava a cada
         # carregamento, lendo o banco inteiro e travando todas as telas).
