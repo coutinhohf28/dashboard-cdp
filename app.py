@@ -1022,6 +1022,7 @@ def run_exec(query, params=()):
         q = query.replace('?', '%s')
         with conn.cursor() as cur:
             cur.execute(q, params if params else None)
+            afetados = cur.rowcount
             # Log apenas de mutações reais (ignora CREATE/DROP idempotente de setup)
             q_upper = query.lstrip().upper()
             if q_upper.startswith(("INSERT", "UPDATE", "DELETE")):
@@ -1035,13 +1036,65 @@ def run_exec(query, params=()):
                     "(SELECT id FROM Logs ORDER BY id DESC LIMIT 1000)"
                 )
         conn.commit()
-        # Cache invalidado apenas pelo TTL (60s/300s) — evita reload total a cada escrita.
-        # run_query_cached.clear() foi removido: causava reload de ~47 queries em cada ação.
+        return afetados
     except Exception as e:
         conn.rollback()
         st.error(f"Erro ao salvar: {e}")
     finally:
         pool.putconn(conn)
+
+
+def editar_ficha_parceiro(codigo, ficha):
+    categorias = run_query_slow("SELECT id_categoria, nome_categoria FROM Categoria_Parceiro ORDER BY nome_categoria")
+    if "id_categoria" not in categorias:
+        st.warning("Não foi possível carregar as categorias para edição.")
+        return
+    nomes_cat = {int(c.id_categoria): c.nome_categoria for c in categorias.itertuples()}
+    atual = int(ficha.id_categoria) if pd.notna(ficha.id_categoria) else None
+    if atual is not None:
+        nomes_cat.setdefault(atual, f"Categoria #{atual}")
+
+    def opcao(rotulo, opcoes, valor):
+        valor = None if pd.isna(valor) else valor
+        itens = list(dict.fromkeys([None, *opcoes, valor]))
+        return st.selectbox(rotulo, itens, index=itens.index(valor),
+                            format_func=lambda item: "Sem informação" if item is None else item)
+
+    with st.expander("Editar cadastro do parceiro", expanded=True):
+        with st.form(f"editar_parceiro_{codigo}_{ficha.versao}"):
+            nome = st.text_input("Nome da instituição", value=ficha.nome_instituicao)
+            esquerda, direita = st.columns(2)
+            with esquerda:
+                data = st.date_input("Data de adesão", value=ficha.data_adesao if pd.notna(ficha.data_adesao) else None,
+                                     min_value=datetime(1900, 1, 1).date(), max_value=datetime(2100, 12, 31).date(), format="DD/MM/YYYY")
+                status = opcao("Status do cadastro", ["Ativo", "Inativo", "Prospecção"], ficha.status)
+                ids = [None, *nomes_cat]
+                categoria = st.selectbox("Categoria do parceiro", ids, index=ids.index(atual),
+                                         format_func=lambda item: nomes_cat.get(item, "Sem categoria"))
+            with direita:
+                sub = st.text_input("Subcategoria", value=ficha.subcategoria or "")
+                publico = opcao("Público da régua de relacionamento", REGUA_CONFIG, ficha.tipo_publico_regua)
+            obs = st.text_area("Observação estratégica", value=ficha.observacao_estrategica or "")
+            salvar = st.form_submit_button("Salvar alterações", type="primary")
+        if salvar:
+            if not nome.strip():
+                st.error("Informe o nome da instituição.")
+                return
+            alterados = run_exec("""
+                UPDATE Parceiro SET nome_instituicao=%s, data_adesao=%s, status=%s, id_categoria=%s,
+                    subcategoria=%s, tipo_publico_regua=%s, observacao_estrategica=%s
+                WHERE id_parceiro=%s AND xmin::text=%s
+            """, (nome.strip(), data, status, categoria, sub.strip() or None, publico,
+                  obs.strip() or None, codigo, ficha.versao))
+            if alterados == 1:
+                run_query_cached.clear()
+                run_query_slow.clear()
+                _parceiros_lista.clear()
+                st.session_state.aviso_ficha = f"Cadastro de {nome.strip()} atualizado."
+                st.rerun()
+            elif alterados == 0:
+                run_query_cached.clear()
+                st.warning("O cadastro mudou. Reabra a ficha para conferir os dados antes de salvar.")
 
 
 # Alias para não quebrar as ~20 chamadas existentes no código
@@ -4586,7 +4639,7 @@ elif menu == "Parcerias":
         # 1. BUSCA DE DADOS
         try:
             query = """
-                SELECT p.*, c.nome_categoria 
+                SELECT p.*, p.xmin::text AS versao, c.nome_categoria 
                 FROM Parceiro p 
                 LEFT JOIN Categoria_Parceiro c ON p.id_categoria = c.id_categoria
             """
@@ -4610,7 +4663,7 @@ elif menu == "Parcerias":
         busca = st.text_input("Pesquisar parceiro", placeholder="Digite para filtrar por nome...")
         df_view = df_p.copy()
         if busca and not df_view.empty:
-            df_view = df_view[df_view['nome_instituicao'].str.contains(busca, case=False, na=False)]
+            df_view = df_view[df_view['nome_instituicao'].str.contains(busca, case=False, na=False, regex=False)]
 
         # Tabela amigável — renomeia colunas e esconde técnicas
         if not df_view.empty:
@@ -4651,12 +4704,16 @@ elif menu == "Parcerias":
 
         section("Ficha do parceiro")
 
-        # Cria uma lista de nomes para o selectbox
-        lista_nomes = df_p['nome_instituicao'].tolist() if not df_p.empty else []
-        parceiro_selecionado = st.selectbox("Selecione um parceiro para ver os contatos vinculados:", ["Selecione..."] + lista_nomes)
-
-        if parceiro_selecionado != "Selecione...":
-            id_selecionado = df_p[df_p['nome_instituicao'] == parceiro_selecionado]['id_parceiro'].values[0]
+        nomes = {int(r.id_parceiro): r.nome_instituicao for r in df_view.itertuples()}
+        id_selecionado = st.selectbox("Selecione o parceiro para abrir a ficha", [None, *nomes],
+                                      format_func=lambda i: "Selecione..." if i is None else f"{nomes[i]} · #{i}")
+        if "aviso_ficha" in st.session_state:
+            st.success(st.session_state.pop("aviso_ficha"))
+        if id_selecionado is not None:
+            parceiro_selecionado = nomes[id_selecionado]
+            ficha = df_view.loc[df_view.id_parceiro == id_selecionado].iloc[0]
+            if (_is_gerente() or st.session_state.user_data.get("setor") == "APRENDIZ") and "versao" in ficha:
+                editar_ficha_parceiro(id_selecionado, ficha)
             query_contatos = f"""
                 SELECT nome_pessoa as Nome, cargo as Cargo, telefone as WhatsApp, email as Email 
                 FROM Contato_Direto 
@@ -4674,7 +4731,7 @@ elif menu == "Parcerias":
                 empty_state("—", f"Sem contatos em {parceiro_selecionado}", "Use o botao NOVO no topo do menu para cadastrar um contato.")
 
             # --- AÇÃO RÁPIDA: alterar status do parceiro ---
-            _status_atual = str(df_p[df_p['nome_instituicao'] == parceiro_selecionado]['status'].values[0])
+            _status_atual = str(ficha['status'])
             st.write(f"**Status atual:** {_status_atual}")
             _cs1, _cs2, _cs3 = st.columns(3)
             if _status_atual != "Ativo" and _cs1.button("Promover para Ativo", key="st_ativo", use_container_width=True, type="primary"):
