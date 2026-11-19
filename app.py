@@ -15,6 +15,7 @@ import plotly.graph_objects as go
 import psycopg2
 from psycopg2 import pool as pg_pool
 import streamlit as st
+from di_auth import CONTAS, authenticate
 
 # set_page_config DEVE ser o primeiro comando Streamlit do script
 st.set_page_config(
@@ -92,14 +93,18 @@ def format_br(valor):
 # ------------------------------------------------------------
 #  LOGIN — sistema único (multiusuário com perfis)
 # ------------------------------------------------------------
-CONTAS = {
-    "alice":    {"nome": "Alice Karine",    "setor": "MARKETING DIGITAL", "senha": "123456", "perfil": "operacional"},
-    "daniel":   {"nome": "Daniel",          "setor": "MARKETING DIGITAL", "senha": "123456", "perfil": "operacional"},
-    "imprensa": {"nome": "Michelle Phiffer","setor": "IMPRENSA",          "senha": "cdp2",   "perfil": "operacional"},
-    "projetos": {"nome": "Viviane Moura",   "setor": "PROJETOS",          "senha": "cdp3",   "perfil": "operacional"},
-    "fernanda": {"nome": "Fernanda Barbosa",  "setor": "APRENDIZ",          "senha": "Cdp4",   "perfil": "operacional"},
-    "gerencia": {"nome": "Helder Coutinho", "setor": "GERÊNCIA",          "senha": "Hc!24601","perfil": "gerencia"},
-}
+def _db_url() -> str:
+    """Lê a URL do banco de variável de ambiente ou st.secrets."""
+    url = os.environ.get("DATABASE_URL", "")
+    if not url:
+        try:
+            url = st.secrets["DATABASE_URL"]
+        except Exception:
+            url = ""
+    # Supabase às vezes retorna postgres:// — psycopg2 precisa de postgresql://
+    if url.startswith("postgres://"):
+        url = url.replace("postgres://", "postgresql://", 1)
+    return url
 
 def _perfil():
     try:
@@ -108,14 +113,27 @@ def _perfil():
         return "operacional"
 def _is_gerente(): return _perfil() == "gerencia"
 
-def _verificar_senha(login: str, senha_digitada: str) -> bool:
-    """Verifica senha: CONTAS dict (lookup instantâneo, sem DB no login)."""
-    if login not in CONTAS:
-        return False
-    return CONTAS[login]["senha"] == senha_digitada
+def _verificar_senha(login, senha, nova=None):
+    try:
+        return authenticate(_db_url(), login, senha, nova)
+    except (psycopg2.Error, ValueError):
+        st.error("Serviço de autenticação indisponível. Contate a gerência.")
+        st.stop()
 
 
-if "autenticado" not in st.session_state:
+def _alterar_senha(login, atual, nova, confirmacao):
+    if len(nova) < 12 or nova == atual:
+        st.error("Escolha uma nova senha com pelo menos 12 caracteres.")
+    elif nova != confirmacao:
+        st.error("As senhas não conferem.")
+    elif _verificar_senha(login, atual, nova):
+        st.success("Senha alterada com sucesso.")
+    else:
+        st.error("Confira a senha atual e tente novamente.")
+
+
+if not st.session_state.get("_login_privado_v1"):
+    st.session_state._login_privado_v1 = True
     st.session_state.autenticado = False
     st.session_state.user_data = None
 
@@ -794,33 +812,6 @@ st.markdown(CSS_GLOBAL, unsafe_allow_html=True)
 
 # (overlay JS removido)
 
-# ── Sincroniza senhas alteradas pelo usuário (DB → CONTAS em memória) ─────────
-# Roda apenas uma vez por sessão para evitar queries repetidas
-if not st.session_state.get("_senhas_sincronizadas"):
-    try:
-        _url_sync = os.environ.get("DATABASE_URL", "")
-        if not _url_sync:
-            try:
-                _url_sync = st.secrets["DATABASE_URL"]
-            except Exception:
-                _url_sync = ""
-        if _url_sync.startswith("postgres://"):
-            _url_sync = _url_sync.replace("postgres://", "postgresql://", 1)
-        if _url_sync:
-            _conn_sync = psycopg2.connect(_url_sync, connect_timeout=3)
-            with _conn_sync.cursor() as _cur_sync:
-                _cur_sync.execute(
-                    "SELECT login, senha FROM Usuario_Senhas"
-                )
-                for _row_s in _cur_sync.fetchall():
-                    if _row_s[0] in CONTAS:
-                        CONTAS[_row_s[0]]["senha"] = _row_s[1]
-            _conn_sync.close()
-    except Exception:
-        pass
-    st.session_state["_senhas_sincronizadas"] = True
-
-
 # ============================================================
 #  DESIGN SYSTEM — COMPONENTES PYTHON REUTILIZÁVEIS
 # ============================================================
@@ -974,19 +965,6 @@ menu = st.session_state.current_page
 # ------------------------------------------------------------
 #  BANCO DE DADOS — Supabase / PostgreSQL
 # ------------------------------------------------------------
-def _db_url() -> str:
-    """Lê a URL do banco de variável de ambiente ou st.secrets."""
-    url = os.environ.get("DATABASE_URL", "")
-    if not url:
-        try:
-            url = st.secrets["DATABASE_URL"]
-        except Exception:
-            url = ""
-    # Supabase às vezes retorna postgres:// — psycopg2 precisa de postgresql://
-    if url.startswith("postgres://"):
-        url = url.replace("postgres://", "postgresql://", 1)
-    return url
-
 @st.cache_resource
 def _pool() -> pg_pool.ThreadedConnectionPool:
     """Pool de conexões (reutilizado entre reruns do Streamlit)."""
@@ -1044,6 +1022,7 @@ def run_exec(query, params=()):
         q = query.replace('?', '%s')
         with conn.cursor() as cur:
             cur.execute(q, params if params else None)
+            afetados = cur.rowcount
             # Log apenas de mutações reais (ignora CREATE/DROP idempotente de setup)
             q_upper = query.lstrip().upper()
             if q_upper.startswith(("INSERT", "UPDATE", "DELETE")):
@@ -1057,13 +1036,65 @@ def run_exec(query, params=()):
                     "(SELECT id FROM Logs ORDER BY id DESC LIMIT 1000)"
                 )
         conn.commit()
-        # Cache invalidado apenas pelo TTL (60s/300s) — evita reload total a cada escrita.
-        # run_query_cached.clear() foi removido: causava reload de ~47 queries em cada ação.
+        return afetados
     except Exception as e:
         conn.rollback()
         st.error(f"Erro ao salvar: {e}")
     finally:
         pool.putconn(conn)
+
+
+def editar_ficha_parceiro(codigo, ficha):
+    categorias = run_query_slow("SELECT id_categoria, nome_categoria FROM Categoria_Parceiro ORDER BY nome_categoria")
+    if "id_categoria" not in categorias:
+        st.warning("Não foi possível carregar as categorias para edição.")
+        return
+    nomes_cat = {int(c.id_categoria): c.nome_categoria for c in categorias.itertuples()}
+    atual = int(ficha.id_categoria) if pd.notna(ficha.id_categoria) else None
+    if atual is not None:
+        nomes_cat.setdefault(atual, f"Categoria #{atual}")
+
+    def opcao(rotulo, opcoes, valor):
+        valor = None if pd.isna(valor) else valor
+        itens = list(dict.fromkeys([None, *opcoes, valor]))
+        return st.selectbox(rotulo, itens, index=itens.index(valor),
+                            format_func=lambda item: "Sem informação" if item is None else item)
+
+    with st.expander("Editar cadastro do parceiro", expanded=True):
+        with st.form(f"editar_parceiro_{codigo}_{ficha.versao}"):
+            nome = st.text_input("Nome da instituição", value=ficha.nome_instituicao)
+            esquerda, direita = st.columns(2)
+            with esquerda:
+                data = st.date_input("Data de adesão", value=ficha.data_adesao if pd.notna(ficha.data_adesao) else None,
+                                     min_value=datetime(1900, 1, 1).date(), max_value=datetime(2100, 12, 31).date(), format="DD/MM/YYYY")
+                status = opcao("Status do cadastro", ["Ativo", "Inativo", "Prospecção"], ficha.status)
+                ids = [None, *nomes_cat]
+                categoria = st.selectbox("Categoria do parceiro", ids, index=ids.index(atual),
+                                         format_func=lambda item: nomes_cat.get(item, "Sem categoria"))
+            with direita:
+                sub = st.text_input("Subcategoria", value=ficha.subcategoria or "")
+                publico = opcao("Público da régua de relacionamento", REGUA_CONFIG, ficha.tipo_publico_regua)
+            obs = st.text_area("Observação estratégica", value=ficha.observacao_estrategica or "")
+            salvar = st.form_submit_button("Salvar alterações", type="primary")
+        if salvar:
+            if not nome.strip():
+                st.error("Informe o nome da instituição.")
+                return
+            alterados = run_exec("""
+                UPDATE Parceiro SET nome_instituicao=%s, data_adesao=%s, status=%s, id_categoria=%s,
+                    subcategoria=%s, tipo_publico_regua=%s, observacao_estrategica=%s
+                WHERE id_parceiro=%s AND xmin::text=%s
+            """, (nome.strip(), data, status, categoria, sub.strip() or None, publico,
+                  obs.strip() or None, codigo, ficha.versao))
+            if alterados == 1:
+                run_query_cached.clear()
+                run_query_slow.clear()
+                _parceiros_lista.clear()
+                st.session_state.aviso_ficha = f"Cadastro de {nome.strip()} atualizado."
+                st.rerun()
+            elif alterados == 0:
+                run_query_cached.clear()
+                st.warning("O cadastro mudou. Reabra a ficha para conferir os dados antes de salvar.")
 
 
 # Alias para não quebrar as ~20 chamadas existentes no código
@@ -4089,25 +4120,12 @@ elif menu == "Ações":
     # ── Minha Senha ──────────────────────────────────────────────────────────
     with st.expander("Alterar minha senha"):
         _login_cur = next((k for k, v in CONTAS.items() if v.get("nome") == meu_nome), None)
-        run_exec("""CREATE TABLE IF NOT EXISTS Usuario_Senhas (login TEXT PRIMARY KEY, senha TEXT NOT NULL)""")
         with st.form("form_senha_acao", clear_on_submit=True):
             _s1 = st.text_input("Senha atual",        type="password", placeholder="••••••")
-            _s2 = st.text_input("Nova senha",         type="password", placeholder="Mínimo 6 caracteres")
+            _s2 = st.text_input("Nova senha",         type="password", placeholder="Mínimo 12 caracteres")
             _s3 = st.text_input("Confirmar nova senha", type="password", placeholder="Repita a nova senha")
             if st.form_submit_button("Salvar", use_container_width=True, type="primary"):
-                _df_s = run_query("SELECT senha FROM Usuario_Senhas WHERE login=%s", (_login_cur,))
-                _senha_ok = _df_s.iloc[0]["senha"] if not _df_s.empty else CONTAS.get(_login_cur,{}).get("senha","")
-                if not _s1:
-                    st.error("Informe a senha atual.")
-                elif _s1 != _senha_ok:
-                    st.error("Senha atual incorreta.")
-                elif len(_s2) < 6:
-                    st.error("A nova senha deve ter pelo menos 6 caracteres.")
-                elif _s2 != _s3:
-                    st.error("As senhas não conferem.")
-                else:
-                    run_exec("INSERT INTO Usuario_Senhas (login,senha) VALUES (%s,%s) ON CONFLICT (login) DO UPDATE SET senha=EXCLUDED.senha", (_login_cur, _s2))
-                    st.success("Senha alterada com sucesso.")
+                _alterar_senha(_login_cur, _s1, _s2, _s3)
 
 
 elif menu == "Almoço CDP":
@@ -4621,7 +4639,7 @@ elif menu == "Parcerias":
         # 1. BUSCA DE DADOS
         try:
             query = """
-                SELECT p.*, c.nome_categoria 
+                SELECT p.*, p.xmin::text AS versao, c.nome_categoria 
                 FROM Parceiro p 
                 LEFT JOIN Categoria_Parceiro c ON p.id_categoria = c.id_categoria
             """
@@ -4645,7 +4663,7 @@ elif menu == "Parcerias":
         busca = st.text_input("Pesquisar parceiro", placeholder="Digite para filtrar por nome...")
         df_view = df_p.copy()
         if busca and not df_view.empty:
-            df_view = df_view[df_view['nome_instituicao'].str.contains(busca, case=False, na=False)]
+            df_view = df_view[df_view['nome_instituicao'].str.contains(busca, case=False, na=False, regex=False)]
 
         # Tabela amigável — renomeia colunas e esconde técnicas
         if not df_view.empty:
@@ -4686,12 +4704,16 @@ elif menu == "Parcerias":
 
         section("Ficha do parceiro")
 
-        # Cria uma lista de nomes para o selectbox
-        lista_nomes = df_p['nome_instituicao'].tolist() if not df_p.empty else []
-        parceiro_selecionado = st.selectbox("Selecione um parceiro para ver os contatos vinculados:", ["Selecione..."] + lista_nomes)
-
-        if parceiro_selecionado != "Selecione...":
-            id_selecionado = df_p[df_p['nome_instituicao'] == parceiro_selecionado]['id_parceiro'].values[0]
+        nomes = {int(r.id_parceiro): r.nome_instituicao for r in df_view.itertuples()}
+        id_selecionado = st.selectbox("Selecione o parceiro para abrir a ficha", [None, *nomes],
+                                      format_func=lambda i: "Selecione..." if i is None else f"{nomes[i]} · #{i}")
+        if "aviso_ficha" in st.session_state:
+            st.success(st.session_state.pop("aviso_ficha"))
+        if id_selecionado is not None:
+            parceiro_selecionado = nomes[id_selecionado]
+            ficha = df_view.loc[df_view.id_parceiro == id_selecionado].iloc[0]
+            if (_is_gerente() or st.session_state.user_data.get("setor") == "APRENDIZ") and "versao" in ficha:
+                editar_ficha_parceiro(id_selecionado, ficha)
             query_contatos = f"""
                 SELECT nome_pessoa as Nome, cargo as Cargo, telefone as WhatsApp, email as Email 
                 FROM Contato_Direto 
@@ -4709,7 +4731,7 @@ elif menu == "Parcerias":
                 empty_state("—", f"Sem contatos em {parceiro_selecionado}", "Use o botao NOVO no topo do menu para cadastrar um contato.")
 
             # --- AÇÃO RÁPIDA: alterar status do parceiro ---
-            _status_atual = str(df_p[df_p['nome_instituicao'] == parceiro_selecionado]['status'].values[0])
+            _status_atual = str(ficha['status'])
             st.write(f"**Status atual:** {_status_atual}")
             _cs1, _cs2, _cs3 = st.columns(3)
             if _status_atual != "Ativo" and _cs1.button("Promover para Ativo", key="st_ativo", use_container_width=True, type="primary"):
@@ -5799,21 +5821,7 @@ with st.expander(f"Conta — {_ud.get('nome','')}", expanded=False):
             _s2 = st.text_input("Nova senha",          type="password")
             _s3 = st.text_input("Confirmar nova senha", type="password")
             if st.form_submit_button("Salvar", use_container_width=True, type="primary"):
-                _df_s = run_query("SELECT senha FROM Usuario_Senhas WHERE login=%s", (_login_cur,))
-                _senha_ok = _df_s.iloc[0]["senha"] if not _df_s.empty else CONTAS.get(_login_cur, {}).get("senha", "")
-                if not _s1:
-                    st.error("Informe a senha atual.")
-                elif _s1 != _senha_ok:
-                    st.error("Senha atual incorreta.")
-                elif len(_s2) < 6:
-                    st.error("A nova senha deve ter pelo menos 6 caracteres.")
-                elif _s2 != _s3:
-                    st.error("As senhas não conferem.")
-                elif _login_cur is None:
-                    st.error("Usuário não identificado.")
-                else:
-                    run_exec("INSERT INTO Usuario_Senhas (login,senha) VALUES (%s,%s) ON CONFLICT (login) DO UPDATE SET senha=EXCLUDED.senha", (_login_cur, _s2))
-                    st.success("Senha alterada com sucesso.")
+                _alterar_senha(_login_cur, _s1, _s2, _s3)
     if _is_gerente():
         # Backup SOB DEMANDA — só gera quando clicado (antes rodava a cada
         # carregamento, lendo o banco inteiro e travando todas as telas).
