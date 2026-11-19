@@ -4635,169 +4635,182 @@ elif menu == "Parcerias":
     tab1, tab2, tab3, tab4 = st.tabs(["Parceiros", "Projetos", "Funil de conversão", "Importar em lote"])
     
     with tab1:
+        pode_conferir = _is_gerente() or st.session_state.user_data.get("setor") == "APRENDIZ"
+        if st.session_state.get("open_form") == "parceiro":
+            st.session_state.modo_parcerias = "Todos os parceiros"
+        modo = st.radio("Visualização de parceiros", ["Todos os parceiros", "Cadastros a conferir"],
+                        horizontal=True, label_visibility="collapsed", key="modo_parcerias") if pode_conferir else "Todos os parceiros"
+        if modo == "Cadastros a conferir":
+            from conferencia_cadastro import exibir_conferencia
+            exibir_conferencia(run_query, run_exec, editar_ficha_parceiro, st.session_state.user_data["nome"])
 
-        # 1. BUSCA DE DADOS
-        try:
-            query = """
-                SELECT p.*, p.xmin::text AS versao, c.nome_categoria 
-                FROM Parceiro p 
-                LEFT JOIN Categoria_Parceiro c ON p.id_categoria = c.id_categoria
-            """
-            df_p = run_query_cached(query)
-        except Exception:
-            df_p = run_query_cached("SELECT * FROM Parceiro")
+    if modo == "Todos os parceiros":
+        with tab1:
+            # 1. BUSCA DE DADOS
+            try:
+                query = """
+                    SELECT p.*, p.xmin::text AS versao, c.nome_categoria 
+                    FROM Parceiro p 
+                    LEFT JOIN Categoria_Parceiro c ON p.id_categoria = c.id_categoria
+                """
+                df_p = run_query_cached(query)
+            except Exception:
+                df_p = run_query_cached("SELECT * FROM Parceiro")
 
-        # KPIs no topo
-        if not df_p.empty:
-            s_limpo = df_p['status'].fillna("").str.upper().str.strip()
-            kpi_row([
-                {"label": "Total de parceiros", "value": len(df_p)},
-                {"label": "Ativos",       "value": int(s_limpo.str.fullmatch("ATIVO", na=False).sum()), "accent": True},
-                {"label": "Prospecção",   "value": int(s_limpo.str.contains("PROSPEC", na=False).sum())},
-                {"label": "Inativos",     "value": int(s_limpo.str.contains("INATIVO", na=False).sum())},
-            ])
+            # KPIs no topo
+            if not df_p.empty:
+                s_limpo = df_p['status'].fillna("").str.upper().str.strip()
+                kpi_row([
+                    {"label": "Total de parceiros", "value": len(df_p)},
+                    {"label": "Ativos",       "value": int(s_limpo.str.fullmatch("ATIVO", na=False).sum()), "accent": True},
+                    {"label": "Prospecção",   "value": int(s_limpo.str.contains("PROSPEC", na=False).sum())},
+                    {"label": "Inativos",     "value": int(s_limpo.str.contains("INATIVO", na=False).sum())},
+                ])
 
-        section("Buscar e visualizar")
+            section("Buscar e visualizar")
 
-        # Filtro de Busca
-        busca = st.text_input("Pesquisar parceiro", placeholder="Digite para filtrar por nome...")
-        df_view = df_p.copy()
-        if busca and not df_view.empty:
-            df_view = df_view[df_view['nome_instituicao'].str.contains(busca, case=False, na=False, regex=False)]
+            # Filtro de Busca
+            busca = st.text_input("Pesquisar parceiro", placeholder="Digite para filtrar por nome...")
+            df_view = df_p.copy()
+            if busca and not df_view.empty:
+                df_view = df_view[df_view['nome_instituicao'].str.contains(busca, case=False, na=False, regex=False)]
 
-        # Tabela amigável — renomeia colunas e esconde técnicas
-        if not df_view.empty:
-            df_show = df_view.rename(columns={
-                'nome_instituicao': 'Parceiro',
-                'status': 'Status',
-                'data_adesao': 'Adesão',
-                'subcategoria': 'Subcategoria',
-                'nome_categoria': 'Categoria',
-            })
-            # UX: datas nulas ficam em branco; textos vazios viram "—"
-            if 'Adesão' in df_show.columns:
-                df_show['Adesão'] = pd.to_datetime(df_show['Adesão'], errors='coerce')
-            for _col in ['Status', 'Categoria', 'Subcategoria', 'Parceiro']:
-                if _col in df_show.columns:
-                    df_show[_col] = df_show[_col].fillna("—").replace({"": "—", "None": "—"})
-            # Nomes de parceiros/empresas e subcategoria em CAIXA ALTA
-            for _col in ['Parceiro', 'Subcategoria']:
-                if _col in df_show.columns:
-                    df_show[_col] = df_show[_col].astype(str).str.upper()
-            colunas_exibir = [c for c in ['Parceiro', 'Status', 'Categoria', 'Subcategoria', 'Adesão'] if c in df_show.columns]
-            st.dataframe(
-                df_show[colunas_exibir],
-                use_container_width=True, hide_index=True, height=320,
-                column_config={
-                    "Adesão": st.column_config.DateColumn("Adesão", format="DD/MM/YYYY"),
-                }
-            )
-            _cpa1, _cpa2 = st.columns([3, 1])
-            _cpa1.caption(f"Mostrando {len(df_show)} de {len(df_p)} parceiros.")
-            _cpa2.download_button(
-                "Exportar CSV",
-                df_show[colunas_exibir].to_csv(index=False).encode("utf-8-sig"),
-                "parceiros.csv", "text/csv", use_container_width=True, key="exp_parc"
-            )
-        else:
-            empty_state("—", "Nada encontrado", "Ajuste a busca ou cadastre um novo parceiro.")
-
-        section("Ficha do parceiro")
-
-        nomes = {int(r.id_parceiro): r.nome_instituicao for r in df_view.itertuples()}
-        id_selecionado = st.selectbox("Selecione o parceiro para abrir a ficha", [None, *nomes],
-                                      format_func=lambda i: "Selecione..." if i is None else f"{nomes[i]} · #{i}")
-        if "aviso_ficha" in st.session_state:
-            st.success(st.session_state.pop("aviso_ficha"))
-        if id_selecionado is not None:
-            parceiro_selecionado = nomes[id_selecionado]
-            ficha = df_view.loc[df_view.id_parceiro == id_selecionado].iloc[0]
-            if (_is_gerente() or st.session_state.user_data.get("setor") == "APRENDIZ") and "versao" in ficha:
-                editar_ficha_parceiro(id_selecionado, ficha)
-            query_contatos = f"""
-                SELECT nome_pessoa as Nome, cargo as Cargo, telefone as WhatsApp, email as Email 
-                FROM Contato_Direto 
-                WHERE id_parceiro = {id_selecionado}
-            """
-            df_contatos_parceiro = run_query(query_contatos)
-
-            if not df_contatos_parceiro.empty:
-                for _c in ['Nome', 'Cargo']:
-                    if _c in df_contatos_parceiro.columns:
-                        df_contatos_parceiro[_c] = df_contatos_parceiro[_c].fillna("—").replace({"": "—", "None": "—", "(sem nome)": "—"}).astype(str).str.upper()
-                st.write(f"**Pessoas de contato em {parceiro_selecionado.upper()}:**")
-                st.dataframe(df_contatos_parceiro, hide_index=True, use_container_width=True)
+            # Tabela amigável — renomeia colunas e esconde técnicas
+            id_selecionado = None
+            if not df_view.empty:
+                df_show = df_view.rename(columns={
+                    'nome_instituicao': 'Parceiro',
+                    'status': 'Status',
+                    'data_adesao': 'Adesão',
+                    'subcategoria': 'Subcategoria',
+                    'nome_categoria': 'Categoria',
+                })
+                # UX: datas nulas ficam em branco; textos vazios viram "—"
+                if 'Adesão' in df_show.columns:
+                    df_show['Adesão'] = pd.to_datetime(df_show['Adesão'], errors='coerce')
+                for _col in ['Status', 'Categoria', 'Subcategoria', 'Parceiro']:
+                    if _col in df_show.columns:
+                        df_show[_col] = df_show[_col].fillna("—").replace({"": "—", "None": "—"})
+                # Nomes de parceiros/empresas e subcategoria em CAIXA ALTA
+                for _col in ['Parceiro', 'Subcategoria']:
+                    if _col in df_show.columns:
+                        df_show[_col] = df_show[_col].astype(str).str.upper()
+                colunas_exibir = [c for c in ['Parceiro', 'Status', 'Categoria', 'Subcategoria', 'Adesão'] if c in df_show.columns]
+                selecao = st.dataframe(
+                    df_show[colunas_exibir],
+                    use_container_width=True, hide_index=True, height=320,
+                    on_select="rerun", selection_mode="single-row",
+                    key="tabela_parceiros_" + str(hash(tuple(zip(df_view.id_parceiro, df_view.nome_instituicao)))),
+                    column_config={
+                        "Adesão": st.column_config.DateColumn("Adesão", format="DD/MM/YYYY"),
+                    }
+                )
+                if selecao.selection.rows:
+                    id_selecionado = int(df_view.iloc[selecao.selection.rows[0]].id_parceiro)
+                _cpa1, _cpa2 = st.columns([3, 1])
+                _cpa1.caption(f"Mostrando {len(df_show)} de {len(df_p)} parceiros.")
+                _cpa2.download_button(
+                    "Exportar CSV",
+                    df_show[colunas_exibir].to_csv(index=False).encode("utf-8-sig"),
+                    "parceiros.csv", "text/csv", use_container_width=True, key="exp_parc"
+                )
             else:
-                empty_state("—", f"Sem contatos em {parceiro_selecionado}", "Use o botao NOVO no topo do menu para cadastrar um contato.")
+                empty_state("—", "Nada encontrado", "Ajuste a busca ou cadastre um novo parceiro.")
 
-            # --- AÇÃO RÁPIDA: alterar status do parceiro ---
-            _status_atual = str(ficha['status'])
-            st.write(f"**Status atual:** {_status_atual}")
-            _cs1, _cs2, _cs3 = st.columns(3)
-            if _status_atual != "Ativo" and _cs1.button("Promover para Ativo", key="st_ativo", use_container_width=True, type="primary"):
-                run_exec("UPDATE Parceiro SET status='Ativo' WHERE id_parceiro=?", (int(id_selecionado),))
-                run_query_cached.clear()
-                st.success(f"{parceiro_selecionado} agora está Ativo."); st.rerun()
-            if _status_atual != "Prospecção" and _cs2.button("Voltar p/ Prospecção", key="st_prosp", use_container_width=True):
-                run_exec("UPDATE Parceiro SET status='Prospecção' WHERE id_parceiro=?", (int(id_selecionado),))
-                run_query_cached.clear()
-                st.success(f"{parceiro_selecionado} voltou para Prospecção."); st.rerun()
-            if _status_atual != "Inativo" and _cs3.button("Marcar como Inativo", key="st_inativo", use_container_width=True):
-                run_exec("UPDATE Parceiro SET status='Inativo' WHERE id_parceiro=?", (int(id_selecionado),))
-                run_query_cached.clear()
-                st.success(f"{parceiro_selecionado} marcado como Inativo."); st.rerun()
+            section("Ficha do parceiro")
 
-        # 2. SEÇÃO DE CADASTRO
-        # Auto-abre se o usuário veio do botão "+ Novo > Parceiro"
-        _abrir_p = (st.session_state.open_form == "parceiro")
-        if _abrir_p:
-            st.session_state.open_form = None  # consome a flag
-            st.info("Cadastrando novo parceiro — preencha os campos abaixo.")
+            nomes = {int(r.id_parceiro): r.nome_instituicao for r in df_view.itertuples()}
+            if "aviso_ficha" in st.session_state:
+                st.success(st.session_state.pop("aviso_ficha"))
+            if id_selecionado is not None:
+                parceiro_selecionado = nomes[id_selecionado]
+                ficha = df_view.loc[df_view.id_parceiro == id_selecionado].iloc[0]
+                if (_is_gerente() or st.session_state.user_data.get("setor") == "APRENDIZ") and "versao" in ficha:
+                    editar_ficha_parceiro(id_selecionado, ficha)
+                query_contatos = f"""
+                    SELECT nome_pessoa as Nome, cargo as Cargo, telefone as WhatsApp, email as Email 
+                    FROM Contato_Direto 
+                    WHERE id_parceiro = {id_selecionado}
+                """
+                df_contatos_parceiro = run_query(query_contatos)
 
-        with st.expander("**CADASTRAR NOVO PARCEIRO**", expanded=_abrir_p):
-            # Busca categorias para o menu
-            df_cat_list = run_query_slow("SELECT id_categoria, nome_categoria FROM Categoria_Parceiro")
-            opcoes_cat = dict(zip(df_cat_list['nome_categoria'], df_cat_list['id_categoria']))
-            
-            with st.form("form_novo_p", clear_on_submit=True):
-                col1, col2 = st.columns(2)
-                with col1:
-                    nome = st.text_input("Nome da instituição *", placeholder="ex: TIM Brasil S.A.")
-                    data_input = st.date_input("Data de adesão")
-                    sem_data = st.checkbox("Não possuo a data de adesão")
+                if not df_contatos_parceiro.empty:
+                    for _c in ['Nome', 'Cargo']:
+                        if _c in df_contatos_parceiro.columns:
+                            df_contatos_parceiro[_c] = df_contatos_parceiro[_c].fillna("—").replace({"": "—", "None": "—", "(sem nome)": "—"}).astype(str).str.upper()
+                    st.write(f"**Pessoas de contato em {parceiro_selecionado.upper()}:**")
+                    st.dataframe(df_contatos_parceiro, hide_index=True, use_container_width=True)
+                else:
+                    empty_state("—", f"Sem contatos em {parceiro_selecionado}", "Use o botao NOVO no topo do menu para cadastrar um contato.")
 
-                with col2:
-                    status = st.selectbox("Status", ["Ativo", "Inativo", "Prospecção"])
-                    cat_nome = st.selectbox("Categoria principal", options=list(opcoes_cat.keys()))
-                    sub_txt = st.text_input("Subcategoria / Detalhe", placeholder="ex: Telecom")
+                # --- AÇÃO RÁPIDA: alterar status do parceiro ---
+                _status_atual = str(ficha['status'])
+                st.write(f"**Status atual:** {_status_atual}")
+                _cs1, _cs2, _cs3 = st.columns(3)
+                if _status_atual != "Ativo" and _cs1.button("Promover para Ativo", key="st_ativo", use_container_width=True, type="primary"):
+                    run_exec("UPDATE Parceiro SET status='Ativo' WHERE id_parceiro=?", (int(id_selecionado),))
+                    run_query_cached.clear()
+                    st.success(f"{parceiro_selecionado} agora está Ativo."); st.rerun()
+                if _status_atual != "Prospecção" and _cs2.button("Voltar p/ Prospecção", key="st_prosp", use_container_width=True):
+                    run_exec("UPDATE Parceiro SET status='Prospecção' WHERE id_parceiro=?", (int(id_selecionado),))
+                    run_query_cached.clear()
+                    st.success(f"{parceiro_selecionado} voltou para Prospecção."); st.rerun()
+                if _status_atual != "Inativo" and _cs3.button("Marcar como Inativo", key="st_inativo", use_container_width=True):
+                    run_exec("UPDATE Parceiro SET status='Inativo' WHERE id_parceiro=?", (int(id_selecionado),))
+                    run_query_cached.clear()
+                    st.success(f"{parceiro_selecionado} marcado como Inativo."); st.rerun()
 
-                if st.form_submit_button("Salvar parceiro", type="primary", use_container_width=True):
-                    if nome:
-                        id_cat = opcoes_cat[cat_nome]
-                        data_final = None if sem_data else data_input.strftime('%Y-%m-%d')
+            # 2. SEÇÃO DE CADASTRO
+            # Auto-abre se o usuário veio do botão "+ Novo > Parceiro"
+            _abrir_p = (st.session_state.open_form == "parceiro")
+            if _abrir_p:
+                st.session_state.open_form = None  # consome a flag
+                st.info("Cadastrando novo parceiro — preencha os campos abaixo.")
 
-                        try:
-                            sql = """
-                                INSERT INTO Parceiro (nome_instituicao, status, id_categoria, data_adesao, subcategoria)
-                                VALUES (?, ?, ?, ?, ?)
-                            """
-                            run_insert(sql, (nome, status, id_cat, data_final, sub_txt))
-                            st.session_state.parceiro_cadastrado = nome  # para feedback pós-save
-                            st.rerun()
-                        except Exception as e:
-                            st.error(f"Erro técnico ao salvar: {e}")
-                    else:
-                        st.warning("O nome da instituição é obrigatório.")
+            with st.expander("**CADASTRAR NOVO PARCEIRO**", expanded=_abrir_p):
+                # Busca categorias para o menu
+                df_cat_list = run_query_slow("SELECT id_categoria, nome_categoria FROM Categoria_Parceiro")
+                opcoes_cat = dict(zip(df_cat_list['nome_categoria'], df_cat_list['id_categoria']))
 
-        # Feedback pós-cadastro com próxima ação sugerida
-        if st.session_state.get("parceiro_cadastrado"):
-            nome_p = st.session_state.pop("parceiro_cadastrado")
-            st.success(f"**{nome_p}** cadastrado com sucesso!")
-            cf1, cf2 = st.columns(2)
-            if cf1.button("Adicionar contato deste parceiro", use_container_width=True, key="post_add_contato"):
-                _trigger_quick_add("contato"); st.rerun()
-            if cf2.button("Registrar doação deste parceiro", use_container_width=True, key="post_add_doacao"):
-                _trigger_quick_add("doacao"); st.rerun()
+                with st.form("form_novo_p", clear_on_submit=True):
+                    col1, col2 = st.columns(2)
+                    with col1:
+                        nome = st.text_input("Nome da instituição *", placeholder="ex: TIM Brasil S.A.")
+                        data_input = st.date_input("Data de adesão")
+                        sem_data = st.checkbox("Não possuo a data de adesão")
+
+                    with col2:
+                        status = st.selectbox("Status", ["Ativo", "Inativo", "Prospecção"])
+                        cat_nome = st.selectbox("Categoria principal", options=list(opcoes_cat.keys()))
+                        sub_txt = st.text_input("Subcategoria / Detalhe", placeholder="ex: Telecom")
+
+                    if st.form_submit_button("Salvar parceiro", type="primary", use_container_width=True):
+                        if nome:
+                            id_cat = opcoes_cat[cat_nome]
+                            data_final = None if sem_data else data_input.strftime('%Y-%m-%d')
+
+                            try:
+                                sql = """
+                                    INSERT INTO Parceiro (nome_instituicao, status, id_categoria, data_adesao, subcategoria)
+                                    VALUES (?, ?, ?, ?, ?)
+                                """
+                                run_insert(sql, (nome, status, id_cat, data_final, sub_txt))
+                                st.session_state.parceiro_cadastrado = nome  # para feedback pós-save
+                                st.rerun()
+                            except Exception as e:
+                                st.error(f"Erro técnico ao salvar: {e}")
+                        else:
+                            st.warning("O nome da instituição é obrigatório.")
+
+            # Feedback pós-cadastro com próxima ação sugerida
+            if st.session_state.get("parceiro_cadastrado"):
+                nome_p = st.session_state.pop("parceiro_cadastrado")
+                st.success(f"**{nome_p}** cadastrado com sucesso!")
+                cf1, cf2 = st.columns(2)
+                if cf1.button("Adicionar contato deste parceiro", use_container_width=True, key="post_add_contato"):
+                    _trigger_quick_add("contato"); st.rerun()
+                if cf2.button("Registrar doação deste parceiro", use_container_width=True, key="post_add_doacao"):
+                    _trigger_quick_add("doacao"); st.rerun()
 
 # --- ABA DE PROJETOS ---
     with tab2:
